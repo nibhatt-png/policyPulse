@@ -5,37 +5,30 @@ load_dotenv()
 API_KEY = os.getenv("CONGRESS_API_KEY")
 BASE    = "https://api.congress.gov/v3"
 
-KEYWORDS = [
-    "environment", "climate", "clean", "emissions", "conservation",
-    "pollution", "energy", "wildlife", "water", "forest", "algal",
-    "carbon", "renewable", "endangered", "toxic"
-]
+def fetch_bills(topic: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    params = {
+        "api_key": API_KEY,
+        "limit":   limit,
+        "offset":  offset,
+        "sort":    "updateDate+desc",
+    }
 
-def fetch_bills(topic: str, limit: int = 10) -> list[dict]:
+    resp = httpx.get(f"{BASE}/bill/118/hr", params=params)
+    resp.raise_for_status()
+    bills = resp.json().get("bills", [])
+
     results = []
-    offset  = 0
-
-    while len(results) < limit:
-        resp = httpx.get(
-            f"{BASE}/bill/118/hr",
-            params={"api_key": API_KEY, "limit": 50, "offset": offset}
-        )
-        bills = resp.json().get("bills", [])
-        if not bills:
-            break
-        for b in bills:
-            if any(word in b.get("title", "").lower() for word in KEYWORDS):
-                results.append({
-                    "title":        b.get("title"),
-                    "url":          b.get("url"),
-                    "date":         b.get("updateDate"),
-                    "jurisdiction": "federal",
-                    "doc_type":     "legislation",
-                    "issue_tags":   [topic],
-                    "source_name":  "Congress.gov"
-                })
-            if len(results) >= limit:
-                break
-        offset += 50
-
+    for bill in bills:
+        title = bill.get("title", "")
+        if not title:
+            continue
+        results.append({
+            "title":        title,
+            "url":          bill.get("url"),
+            "date":         bill.get("updateDate"),
+            "jurisdiction": "federal",
+            "doc_type":     "legislation",
+            "issue_tags":   [],
+            "source_name":  "Congress.gov"
+        })
     return results

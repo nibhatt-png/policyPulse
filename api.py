@@ -16,14 +16,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class Message(BaseModel):
+    role: str
+    content: str
+
 class Query(BaseModel):
     question: str
+    history: list[Message] = []
 
 @app.post("/ask")
 def ask(query: Query):
-    chunks = retrieve(query.question, top_k=5)
-    answer = synthesize(query.question, chunks)
+    chunks  = retrieve(query.question, top_k=8)
+    history = [{"role": m.role, "content": m.content} for m in query.history]
+    answer  = synthesize(query.question, chunks, history)
     return {
-        "answer": answer,
+        "answer":  answer,
         "sources": chunks
     }

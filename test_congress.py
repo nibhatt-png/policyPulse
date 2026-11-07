@@ -9,7 +9,7 @@ import httpx, os
 API_KEY = os.getenv("CONGRESS_API_KEY")
 
 # get one bill
-bills = fetch_bills("environment", limit=1)
+bills = fetch_bills(limit=1)
 bill  = bills[0]
 print("bill:", bill["title"])
 

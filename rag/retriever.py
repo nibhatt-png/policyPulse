@@ -1,36 +1,150 @@
-import ollama, psycopg2, os
-from dotenv import load_dotenv
-load_dotenv()
+import ollama, re
+from datetime import date
+from rag import db
+
+# How many nearest chunks to consider before grouping by bill. Bills have many
+# (often duplicated) chunks, so the pool must be much larger than top_k to end
+# up with top_k *different* bills. HNSW returns at most hnsw.ef_search rows, so
+# ef_search is raised to match.
+CANDIDATES_PER_RESULT = 25
+MIN_CANDIDATES        = 100
+
+# Most users ask about what Congress is doing now. Bills from past Congresses
+# that didn't pass are dead, so rank them as if they were this much less similar:
+# an old bill still wins when it is clearly more relevant, and still appears
+# when the current Congress has nothing on the topic.
+PAST_CONGRESS_PENALTY = 0.05
+
+# "Recent activity" mode looks at actions within this many days of the newest
+# action in the data (not of today, so a stale ingest still returns results).
+RECENT_DAYS = 30
+RECENT_PER_STAGE = 3
+
+COLUMNS = ["content", "source", "url", "doc_type", "date", "title", "bill_number",
+           "congress", "latest_action", "latest_action_date", "similarity"]
+
+def current_congress(today: date | None = None) -> int:
+    # each Congress starts January 3 of an odd year; the 1st began in 1789
+    today = today or date.today()
+    year = today.year - 1 if (today.month, today.day) < (1, 3) else today.year
+    start_year = year if year % 2 == 1 else year - 1
+    return (start_year - 1789) // 2 + 1
+
+def _to_dicts(rows) -> list[dict]:
+    out = []
+    for r in rows:
+        d = dict(zip(COLUMNS, r))
+        d["similarity"] = float(d["similarity"]) if d["similarity"] is not None else None
+        d["latest_action_date"] = str(d["latest_action_date"]) if d["latest_action_date"] else None
+        out.append(d)
+    return out
 
 def retrieve(query: str, top_k: int = 5) -> list[dict]:
-    resp      = ollama.embeddings(model="nomic-embed-text", prompt=query)
-    embedding = resp["embedding"]
-    
-    # convert to postgres vector string format
-    vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
+    """Return the top_k most similar bills (one best-matching chunk per bill)."""
+    embedding  = ollama.embeddings(model="nomic-embed-text", prompt=query)["embedding"]
+    vec_str    = "[" + ",".join(str(x) for x in embedding) + "]"
+    candidates = min(max(top_k * CANDIDATES_PER_RESULT, MIN_CANDIDATES), 1000)
 
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-    cur  = conn.cursor()
-    cur.execute("""
-        select content, source_name, url, doc_type, date,
-               1 - (embedding <=> %s::vector) as similarity
-        from documents
-        order by embedding <=> %s::vector
-        limit %s
-    """, [vec_str, vec_str, top_k])
+    def query_db(cur):
+        # SET LOCAL lasts only for this transaction
+        cur.execute("set local hnsw.ef_search = %s", [candidates])
+        cur.execute("""
+            with candidates as (
+                select content, source_name, url, doc_type, date, title, bill_number,
+                       congress, latest_action, latest_action_date,
+                       embedding <=> %(vec)s::vector as distance
+                from documents
+                order by embedding <=> %(vec)s::vector
+                limit %(candidates)s
+            ),
+            best_per_bill as (
+                select distinct on (url) *
+                from candidates
+                order by url, distance
+            )
+            select content, source_name, url, doc_type, date, title, bill_number,
+                   congress, latest_action, latest_action_date,
+                   1 - distance as similarity
+            from best_per_bill
+            order by distance + case when congress = %(current)s then 0 else %(penalty)s end
+            limit %(top_k)s
+        """, {"vec": vec_str, "candidates": candidates, "top_k": top_k,
+              "current": current_congress(), "penalty": PAST_CONGRESS_PENALTY})
+        return cur.fetchall()
 
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    return _to_dicts(db.run(query_db))
 
-    return [
-        {
-            "content":    r[0],
-            "source":     r[1],
-            "url":        r[2],
-            "doc_type":   r[3],
-            "date":       r[4],
-            "similarity": float(r[5])
-        }
-        for r in rows
-    ]
+# How far a bill has gotten, judged from its latest action. Most latest actions
+# are routine committee referrals, so ranking by date alone would mostly surface
+# paperwork; this ranks laws and floor votes first.
+STAGE_SQL = r"""
+    case
+        when latest_action ~* '^(became public law|signed by president)' then 5
+        when latest_action ~* '^(presented to president|vetoed)' then 4
+        when latest_action ~* '(passed|agreed to|received in the senate|held at the desk|message on senate action)' then 3
+        when latest_action ~* '(placed on .*calendar|reported|ordered to be reported)' then 2
+        else 1
+    end
+"""
+
+def recent_activity(top_k: int = 8) -> list[dict]:
+    """Current-Congress bills with the most significant recent actions
+    (one representative chunk each: the start of the bill's text)."""
+    def query_db(cur):
+        cur.execute(f"""
+            with window_start as (
+                select max(latest_action_date) - %(days)s as d
+                from documents where congress = %(congress)s
+            ),
+            -- rank bills on their (per-bill) metadata only, without touching chunk text
+            bills as (
+                select url, max(latest_action_date) as action_date, max({STAGE_SQL}) as stage
+                from documents
+                where congress = %(congress)s
+                  and latest_action_date >= (select d from window_start)
+                group by url
+            ),
+            -- take up to PER_STAGE of the newest bills from each stage first, so
+            -- the answer covers new laws AND floor votes AND committee progress,
+            -- then fill any remaining slots by stage and date
+            top_bills as (
+                select url, action_date, stage
+                from (
+                    select *, row_number() over (partition by stage order by action_date desc, url) as rn
+                    from bills
+                ) ranked
+                order by (rn <= %(per_stage)s) desc, stage desc, action_date desc
+                limit %(top_k)s
+            )
+            select distinct on (t.stage, t.action_date, d.url)
+                   d.content, d.source_name, d.url, d.doc_type, d.date, d.title, d.bill_number,
+                   d.congress, d.latest_action, d.latest_action_date, null as similarity
+            from top_bills t
+            join documents d on d.url = t.url
+            order by t.stage desc, t.action_date desc, d.url, d.id   -- first chunk = start of the bill
+        """, {"congress": current_congress(), "days": RECENT_DAYS, "top_k": top_k,
+              "per_stage": RECENT_PER_STAGE})
+        return cur.fetchall()
+
+    return _to_dicts(db.run(query_db))
+
+# Words that don't name a policy topic. A question made only of these
+# ("What is Congress doing right now?") has nothing for similarity search to
+# match on, so it gets recent activity instead.
+NON_TOPIC_WORDS = set("""
+    a an the of on in at to for with about from by and or is are was were be been being
+    am do does did doing done has have had having can could will would should may might
+    what whats what's which who how why when where there here that this these those it its
+    me us we you i my our your tell show give list any anything something everything
+    congress congressional house senate lawmakers legislators legislature representatives
+    senators capitol hill federal government u.s united states washington
+    bill bills law laws legislation legislative act acts measure measures
+    pass passed passing vote voted votes voting introduced signed working work worked
+    right now currently current lately recent recently latest new news today week weeks
+    month months year years days happening going on up update updates going been
+    important major big key top main biggest notable
+""".split())
+
+def is_topicless(question: str) -> bool:
+    words = re.findall(r"[a-z][a-z.'’]*", question.lower())
+    return bool(words) and all(w.strip(".'’") in NON_TOPIC_WORDS for w in words)

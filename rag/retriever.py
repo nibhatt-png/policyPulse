@@ -1,6 +1,7 @@
-import ollama, re
+import re
 from datetime import date
 from rag import db
+from rag.embeddings import embed_query
 
 # How many nearest chunks to consider before grouping by bill. Bills have many
 # (often duplicated) chunks, so the pool must be much larger than top_k to end
@@ -94,7 +95,7 @@ def _merge_companions(bills: list[dict]) -> list[dict]:
 def retrieve(query: str, top_k: int = 5) -> list[dict]:
     """The top_k most similar documents (one best-matching chunk each):
     bills, plus up to MAX_RULINGS court rulings that are about as relevant."""
-    embedding  = ollama.embeddings(model="nomic-embed-text", prompt=query)["embedding"]
+    embedding  = embed_query(query)
     vec_str    = "[" + ",".join(str(x) for x in embedding) + "]"
     candidates = min(max(top_k * CANDIDATES_PER_RESULT, MIN_CANDIDATES), 1000)
 

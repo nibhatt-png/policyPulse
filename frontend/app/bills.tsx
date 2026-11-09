@@ -58,7 +58,12 @@ export function CongressBadge({ congress }: { congress: number | null | undefine
 
 // ---- API ------------------------------------------------------------------
 
-export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Deployed (vercel.json), the API is the same site under /api. For local
+// `next dev` against `uvicorn api:app --port 8000`, set
+// NEXT_PUBLIC_API_URL=http://localhost:8000/api in frontend/.env.local.
+export const API = process.env.NEXT_PUBLIC_API_URL ?? "/api";
+
+export const API_UNREACHABLE = "Couldn't reach the PolicyPulse API. Check your connection and try again.";
 
 // GET an API path, turning failures into readable messages.
 export async function getJSON<T>(path: string): Promise<T> {
@@ -66,7 +71,7 @@ export async function getJSON<T>(path: string): Promise<T> {
   try {
     r = await fetch(API + path);
   } catch {
-    throw new Error("Couldn't reach the API. Is it running on port 8000?");
+    throw new Error(API_UNREACHABLE);
   }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.detail ?? `Server error (${r.status}).`);

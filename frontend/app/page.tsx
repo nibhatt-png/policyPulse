@@ -3,7 +3,7 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import Markdown from "./Markdown";
 import SiteHeader, { Logo } from "./SiteHeader";
-import { API, CongressBadge, RulingBadge, billPageHref, congressGovUrl, formatDate, isRuling } from "./bills";
+import { API, API_UNREACHABLE, CongressBadge, RulingBadge, billPageHref, congressGovUrl, formatDate, isRuling } from "./bills";
 
 type Source = {
   source: string;
@@ -193,7 +193,7 @@ export default function Home() {
     } catch (err) {
       const reason =
         err instanceof TypeError
-          ? "Couldn't reach the API. Is it running on port 8000?"
+          ? API_UNREACHABLE
           : err instanceof Error
             ? err.message
             : "Unknown error.";

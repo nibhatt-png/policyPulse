@@ -4,7 +4,7 @@ import { useSearchParams } from "next/navigation";
 import Markdown from "../Markdown";
 import SiteHeader from "../SiteHeader";
 import Link from "next/link";
-import { API, CongressBadge, RulingBadge, billPageHref, congressGovUrl, formatDate, getJSON, isRuling } from "../bills";
+import { API, API_UNREACHABLE, CongressBadge, RulingBadge, billPageHref, congressGovUrl, formatDate, getJSON, isRuling } from "../bills";
 
 type RelatedItem = {
   url: string;
@@ -118,7 +118,7 @@ export default function BillPage() {
         else setBill(data);
       })
       .catch((err) => {
-        setError(err instanceof TypeError ? "Couldn't reach the API. Is it running on port 8000?" : err.message);
+        setError(err instanceof TypeError ? API_UNREACHABLE : err.message);
       })
       .finally(() => setLoading(false));
   }, [billUrl]);

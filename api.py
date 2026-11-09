@@ -1,5 +1,5 @@
 import re
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -10,14 +10,22 @@ from rag import db
 from rag.synthesizer import synthesize, clean_markdown, MODEL
 from rag.topics import TOPICS_BY_SLUG
 from rag import browse, summaries
+from rag.embeddings import EmbeddingError
 from groq import Groq, APIStatusError, APIConnectionError
 import os, traceback, psycopg2
 
 app = FastAPI()
 
+# Every route is under /api. On Vercel (vercel.json) the site and the API share
+# one domain: /api/... goes to this service, everything else to the Next.js
+# frontend, and the service sees the full path (/api/ask, not /ask).
+router = APIRouter(prefix="/api")
+
+# Only for local development, where the frontend (next dev) and this API run
+# on different ports. In production they share a domain, so CORS doesn't apply.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -32,7 +40,7 @@ class Query(BaseModel):
     question: str
     history: list[Message] = []
 
-@app.post("/ask")
+@router.post("/ask")
 def ask(query: Query):
     history = [{"role": m.role, "content": m.content} for m in query.history]
     try:
@@ -59,6 +67,11 @@ def readable_error(e: Exception) -> HTTPException:
         return HTTPException(503, "Couldn't reach the AI model. Check your internet connection and try again.")
     if isinstance(e, psycopg2.Error):
         return HTTPException(503, "Couldn't reach the bill database. Check your internet connection and try again.")
+    if isinstance(e, EmbeddingError):
+        print(f"embedding failed: {e}", flush=True)
+        return HTTPException(503, "Couldn't reach the search service. Wait a moment and try again.")
+    if isinstance(e, ConnectionError):   # local: the Ollama app isn't running
+        return HTTPException(503, "Couldn't reach the search model. Start the Ollama app and try again.")
     traceback.print_exc()
     return HTTPException(500, "Something went wrong on the server.")
 
@@ -86,7 +99,7 @@ def ruling_excerpt(text: str, head: int = 3000, budget: int = 5000) -> str:
         return text[:head + budget]
     return opening + "\n\n[...]\n\n" + "\n\n[...]\n\n".join(picked)
 
-@app.get("/bill")
+@router.get("/bill")
 def get_bill(url: str):
     try:
         def query_db(cur):
@@ -179,7 +192,7 @@ Bill text:
 
 MAX_RELATED = 12
 
-@app.get("/related")
+@router.get("/related")
 def related(url: str):
     """For a bill: court rulings on the laws it would change. For a ruling:
     current bills that would change the law it interprets. Each item lists
@@ -232,14 +245,14 @@ def get_topic(slug: str):
         raise HTTPException(404, "No such topic.")
     return topic
 
-@app.get("/topics")
+@router.get("/topics")
 def list_topics():
     try:
         return {"as_of": browse.data_as_of(), "topics": browse.topic_overview()}
     except Exception as e:
         raise readable_error(e)
 
-@app.get("/topics/{slug}")
+@router.get("/topics/{slug}")
 def topic_page(slug: str):
     topic = get_topic(slug)
     try:
@@ -253,7 +266,7 @@ def topic_page(slug: str):
             "description": topic.description, "as_of": as_of, "total": len(bills),
             "groups": [g for g in groups if g["bills"]]}
 
-@app.get("/topics/{slug}/summary")
+@router.get("/topics/{slug}/summary")
 def topic_summary(slug: str):
     topic = get_topic(slug)
     try:
@@ -266,7 +279,7 @@ def check_days(days: int) -> int:
         raise HTTPException(400, f"days must be one of {browse.WHATS_NEW_PERIODS}.")
     return days
 
-@app.get("/whats-new")
+@router.get("/whats-new")
 def whats_new(days: int = 7):
     check_days(days)
     try:
@@ -274,10 +287,13 @@ def whats_new(days: int = 7):
     except Exception as e:
         raise readable_error(e)
 
-@app.get("/whats-new/summary")
+@router.get("/whats-new/summary")
 def whats_new_summary(days: int = 7):
     check_days(days)
     try:
         return {"summary": summaries.period_summary(browse.whats_new(days=days))}
     except Exception as e:
         raise readable_error(e)
+
+# after all routes are defined on the router
+app.include_router(router)

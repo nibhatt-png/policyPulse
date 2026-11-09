@@ -1,0 +1,8 @@
+# Everything for local work: the API plus the ingest, the daily update
+# (ingest/), and the old Streamlit UI (app/main.py). Not deployed.
+-r requirements.txt
+uvicorn>=0.30          # runs the API locally: venv/bin/uvicorn api:app --port 8000
+httpx>=0.27.0          # Congress.gov and CourtListener clients
+pdfplumber>=0.10.3     # bill text published only as PDF
+streamlit>=1.35.0      # app/main.py
+ollama>=0.6            # embeddings: every stored chunk, and questions when NOMIC_API_KEY isn't set

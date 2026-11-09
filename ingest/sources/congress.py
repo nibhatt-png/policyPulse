@@ -57,6 +57,11 @@ def fetch_all_bills(congress: int, bill_type: str, since: str | None = None) -> 
         offset += PAGE
     return sorted(bills.values(), key=lambda b: b["date"] or "", reverse=True)
 
+def fetch_policy_area(bill_url: str) -> str | None:
+    """e.g. "Health". Assigned by CRS, usually within a few weeks of introduction."""
+    resp = http.get(bill_url.split("?")[0], params={"api_key": API_KEY, "format": "json"})
+    return ((resp.json().get("bill") or {}).get("policyArea") or {}).get("name")
+
 def fetch_text_versions(bill_url: str) -> list[dict]:
     """The bill's published text versions, e.g. "Introduced in House",
     "Engrossed in House", "Referred in Senate", "Public Law"."""

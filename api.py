@@ -1,3 +1,4 @@
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,6 +8,8 @@ load_dotenv()
 from rag.retriever import retrieve, recent_activity, is_topicless
 from rag import db
 from rag.synthesizer import synthesize, clean_markdown, MODEL
+from rag.topics import TOPICS_BY_SLUG
+from rag import browse, summaries
 from groq import Groq, APIStatusError, APIConnectionError
 import os, traceback, psycopg2
 
@@ -59,13 +62,37 @@ def readable_error(e: Exception) -> HTTPException:
     traceback.print_exc()
     return HTTPException(500, "Something went wrong on the server.")
 
+# Sentences where an opinion states its outcome. Opinions usually reach their
+# holding far past the opening, which is all a plain cut would show the model.
+HOLDING_RE = re.compile(r"\b(we hold|we conclude|we therefore|we affirm|we reverse|we vacate|"
+                        r"accordingly|for (?:the|these) reasons|(?:is|are) (?:affirmed|reversed|vacated)|remanded)\b", re.I)
+
+def ruling_excerpt(text: str, head: int = 3000, budget: int = 5000) -> str:
+    """The opinion's opening plus the passages around its conclusions (about 8,000
+    characters, which fits Groq's per-minute token limit alongside the answer)."""
+    opening = text[:head]
+    sentences = re.split(r"(?<=[.!?])\s+", text[head:])
+    picked, used, last = [], 0, -2
+    for i, sent in enumerate(sentences):
+        if not HOLDING_RE.search(sent):
+            continue
+        passage = " ".join(sentences[max(i - 1, last + 1):i + 2])
+        if not passage or used + len(passage) > budget:
+            continue
+        picked.append(passage)
+        used += len(passage)
+        last = i + 1
+    if not picked:
+        return text[:head + budget]
+    return opening + "\n\n[...]\n\n" + "\n\n[...]\n\n".join(picked)
+
 @app.get("/bill")
 def get_bill(url: str):
     try:
         def query_db(cur):
             cur.execute("""
                 select content, source_name, doc_type, date, url, title, bill_number,
-                       congress, latest_action, latest_action_date
+                       congress, latest_action, latest_action_date, issue_tags
                 from documents
                 where url = %s
                 order by id   -- chunks in text order
@@ -83,7 +110,26 @@ def get_bill(url: str):
     meta      = rows[0]
 
     # generate plain english summary
-    prompt = f"""You are explaining a bill to someone with no legal background.
+    if meta[2] == "ruling":
+        prompt = f"""You are explaining a federal court decision to someone with no legal background.
+
+Given the beginning of this opinion, provide:
+1. **What was this case about?** (2-3 sentences, very simple: who sued whom, and over what)
+2. **What did the court decide?** (2-3 sentences)
+3. **Why?** (the court's main reasoning, as bullet points in plain English)
+4. **What does it mean for people?** (who is affected and how)
+5. **Key things to know** (the law it interprets, the court and year, and anything the excerpt leaves unclear)
+
+Use only what the text says. It's an excerpt: the opening of the opinion, then passages where the court states conclusions. If it doesn't clearly say how the court ruled, say "The excerpt doesn't show the court's final decision" in section 2 instead of inferring it, and don't guess at reasoning you can't see. Keep track of who is asking for what: the party seeking a court's order is not necessarily the winner.
+
+Format your answer in Markdown, using a "## " heading for each of the five sections. Don't use HTML tags.
+
+Case: {meta[5]} ({meta[1]}, decided {meta[3]})
+
+Opinion text (excerpt):
+{ruling_excerpt(full_text)}"""
+    else:
+        prompt = f"""You are explaining a bill to someone with no legal background.
 
 Given this bill text, provide:
 1. **What is this bill about?** (2-3 sentences, very simple)
@@ -122,5 +168,116 @@ Bill text:
         "congress":    meta[7],
         "latest_action":      meta[8],
         "latest_action_date": str(meta[9]) if meta[9] else None,
+        # for a ruling, the statutes it interprets (a bill's list is long; /related uses it)
+        "statutes":    (meta[10] or []) if meta[2] == "ruling" else [],
         "chunks":      len(rows)
     }
+
+# ---- Bills <-> court rulings ---------------------------------------------
+# Linked through the U.S. Code sections both store in issue_tags: the sections
+# a bill cites (mostly ones it amends), and the ones a ruling was matched on.
+
+MAX_RELATED = 12
+
+@app.get("/related")
+def related(url: str):
+    """For a bill: court rulings on the laws it would change. For a ruling:
+    current bills that would change the law it interprets. Each item lists
+    the statutes it shares with the document."""
+    def query_db(cur):
+        cur.execute("select max(doc_type), array_agg(distinct t) from documents, unnest(issue_tags) t where url = %s", [url])
+        doc_type, tags = cur.fetchone()
+        if not doc_type or not tags:
+            return None, []
+        other = "legislation" if doc_type == "ruling" else "ruling"
+        # Sharing a statute makes an item related; how close the openings of the
+        # two texts are (a bill's title and purpose, a case's facts) ranks it, so
+        # a case about FOIA comes before one citing FOIA in passing, and a bill
+        # about FOIA before a 1,000-page bill that mentions it once. (Comparing
+        # every chunk would favor long bills, which have more chances to match.)
+        cur.execute("""
+            with me as (select embedding from documents where url = %(url)s order by id limit 1),
+            openings as (
+                select distinct on (d.url) d.url, d.title, d.bill_number, d.source_name, d.date,
+                       d.latest_action, d.latest_action_date, d.issue_tags, d.embedding
+                from documents d
+                where d.doc_type = %(other)s and d.issue_tags && %(tags)s and d.url <> %(url)s
+                order by d.url, d.id
+            )
+            select url, title, bill_number, source_name, date::text, latest_action, latest_action_date::text,
+                   array(select t from unnest(issue_tags) t where t = any(%(tags)s) order by t) as shared
+            from openings
+            order by embedding <=> (select embedding from me)
+            limit %(limit)s
+        """, {"tags": tags, "other": other, "url": url, "limit": MAX_RELATED})
+        return other, cur.fetchall()
+    try:
+        other, rows = db.run(query_db)
+    except Exception as e:
+        raise readable_error(e)
+    return {
+        "kind": other,   # what the items are: "ruling" or "legislation"; None if nothing links
+        "items": [{"url": r[0], "title": r[1], "bill_number": r[2], "source_name": r[3], "date": r[4],
+                   "latest_action": r[5], "latest_action_date": r[6], "shared": r[7]} for r in rows],
+    }
+
+# ---- Browse: topic pages and "what's new" --------------------------------
+# Bill lists and their AI summaries are separate endpoints so a page can show
+# its bills right away while the summary (cached, but slow when regenerated)
+# loads.
+
+def get_topic(slug: str):
+    topic = TOPICS_BY_SLUG.get(slug)
+    if not topic:
+        raise HTTPException(404, "No such topic.")
+    return topic
+
+@app.get("/topics")
+def list_topics():
+    try:
+        return {"as_of": browse.data_as_of(), "topics": browse.topic_overview()}
+    except Exception as e:
+        raise readable_error(e)
+
+@app.get("/topics/{slug}")
+def topic_page(slug: str):
+    topic = get_topic(slug)
+    try:
+        bills = browse.topic_bills(topic)
+        as_of = browse.data_as_of()
+    except Exception as e:
+        raise readable_error(e)
+    groups = [{"status": s, "label": label, "bills": [b for b in bills if b["status"] == s]}
+              for s, label in sorted(browse.STATUS_LABELS.items(), reverse=True)]
+    return {"slug": topic.slug, "name": topic.name, "icon": topic.icon,
+            "description": topic.description, "as_of": as_of, "total": len(bills),
+            "groups": [g for g in groups if g["bills"]]}
+
+@app.get("/topics/{slug}/summary")
+def topic_summary(slug: str):
+    topic = get_topic(slug)
+    try:
+        return {"summary": summaries.topic_summary(topic, browse.topic_bills(topic), browse.data_as_of())}
+    except Exception as e:
+        raise readable_error(e)
+
+def check_days(days: int) -> int:
+    if days not in browse.WHATS_NEW_PERIODS:
+        raise HTTPException(400, f"days must be one of {browse.WHATS_NEW_PERIODS}.")
+    return days
+
+@app.get("/whats-new")
+def whats_new(days: int = 7):
+    check_days(days)
+    try:
+        return browse.whats_new(days=days)
+    except Exception as e:
+        raise readable_error(e)
+
+@app.get("/whats-new/summary")
+def whats_new_summary(days: int = 7):
+    check_days(days)
+    try:
+        return {"summary": summaries.period_summary(browse.whats_new(days=days))}
+    except Exception as e:
+        raise readable_error(e)

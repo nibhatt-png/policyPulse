@@ -1,7 +1,9 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import Link from "next/link";
 import Markdown from "./Markdown";
-import { CongressBadge, formatDate } from "./bills";
+import SiteHeader, { Logo } from "./SiteHeader";
+import { API, CongressBadge, RulingBadge, billPageHref, congressGovUrl, formatDate, isRuling } from "./bills";
 
 type Source = {
   source: string;
@@ -15,6 +17,8 @@ type Source = {
   congress: number | null;
   latest_action: string | null;
   latest_action_date: string | null;
+  issue_tags?: string[];    // for a ruling: the statutes it interprets
+  companions?: string[];    // for a bill: the same bill in the other chamber
 };
 
 // "H.R. 132: Protecting Local Communities from Harmful Algal Blooms Act"
@@ -47,14 +51,6 @@ type Message = {
   content: string;
   sources?: Source[];
 };
-
-function Logo({ className = "w-9 h-9 text-lg" }: { className?: string }) {
-  return (
-    <div className={`shrink-0 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 shadow-sm flex items-center justify-center ${className}`}>
-      <span className="leading-none">🌿</span>
-    </div>
-  );
-}
 
 function SendIcon() {
   return (
@@ -89,13 +85,61 @@ function DocIcon() {
   );
 }
 
+// Opinions open with "Mr. Justice White delivered the opinion of the Court." and page markers like *136
+function rulingExcerpt(content: string, max = 220) {
+  const text = content
+    .replace(/(?<![\w*])\*\d{1,5}\b/g, " ")
+    .replace(/^.{0,80}?delivered the opinion of the Court\.\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
+}
+
+function RulingSourceCard({ s }: { s: Source }) {
+  return (
+    <div className="p-3 rounded-2xl border border-indigo-100 border-l-4 border-l-indigo-400 bg-white hover:border-indigo-300 hover:shadow-sm transition text-xs">
+      <div className="mb-1.5">
+        <RulingBadge />
+      </div>
+      <p className="font-semibold text-gray-800 text-[13px] leading-snug italic">{s.title}</p>
+      <p className="mt-0.5 mb-2 text-[11px] text-gray-500">
+        {s.source}
+        {s.date ? ` · Decided ${formatDate(s.date)}` : ""}
+      </p>
+      {s.issue_tags && s.issue_tags.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 mb-2">
+          <span className="text-[11px] text-gray-500">Interprets</span>
+          {s.issue_tags.map((t) => (
+            <span key={t} className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[11px] font-medium whitespace-nowrap">
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+      <p className="text-gray-500 leading-relaxed line-clamp-2">{rulingExcerpt(s.content)}</p>
+      <div className="mt-2 flex items-center gap-3">
+        <a href={s.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-indigo-600 hover:underline font-medium">
+          Read opinion <ExternalLinkIcon />
+        </a>
+        <Link href={billPageHref(s.url)} className="inline-flex items-center gap-1 text-indigo-600 hover:underline font-medium">
+          Plain-English summary <ChevronIcon />
+        </Link>
+      </div>
+    </div>
+  );
+}
+
 function SourceCard({ s }: { s: Source }) {
+  if (isRuling(s)) return <RulingSourceCard s={s} />;
   return (
     <div className="p-3 rounded-2xl border border-gray-200 bg-white hover:border-emerald-300 hover:shadow-sm transition text-xs">
       <p className="font-semibold text-gray-800 text-[13px] leading-snug mb-1.5">{billLabel(s)}</p>
-      <div className="flex items-center gap-2 mb-2 text-[11px] text-gray-400">
+      <div className="flex flex-wrap items-center gap-2 mb-2 text-[11px] text-gray-400">
         <CongressBadge congress={s.congress} />
         <span>{s.source}</span>
+        {s.companions && s.companions.length > 0 && (
+          <span title="The same bill was introduced in the other chamber">· Also introduced as {s.companions.join(", ")}</span>
+        )}
       </div>
       {s.latest_action && (
         <p className="text-gray-600 leading-relaxed mb-1.5 line-clamp-2">
@@ -105,12 +149,12 @@ function SourceCard({ s }: { s: Source }) {
       )}
       <p className="text-gray-500 leading-relaxed line-clamp-2">{excerpt(s.content)}</p>
       <div className="mt-2 flex items-center gap-3">
-        <a href={s.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-emerald-600 hover:underline font-medium">
+        <a href={congressGovUrl(s.url)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-emerald-600 hover:underline font-medium">
           View source <ExternalLinkIcon />
         </a>
-        <a href={"/bill?url=" + encodeURIComponent(s.url)} className="inline-flex items-center gap-1 text-emerald-600 hover:underline font-medium">
+        <Link href={billPageHref(s.url)} className="inline-flex items-center gap-1 text-emerald-600 hover:underline font-medium">
           Learn more <ChevronIcon />
-        </a>
+        </Link>
       </div>
     </div>
   );
@@ -138,7 +182,7 @@ export default function Home() {
     const history = newMessages.slice(-6).map((m) => ({ role: m.role, content: m.content }));
 
     try {
-      const resp = await fetch("http://localhost:8000/ask", {
+      const resp = await fetch(`${API}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, history }),
@@ -168,13 +212,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col bg-gray-50">
-      <header className="sticky top-0 z-10 bg-white border-b px-6 py-3.5 flex items-center gap-3">
-        <Logo className="w-9 h-9 text-lg" />
-        <div>
-          <h1 className="text-base font-bold text-gray-900">PolicyPulse</h1>
-          <p className="text-xs text-gray-500">Ask anything about US legislation</p>
-        </div>
-      </header>
+      <SiteHeader />
 
       <div className="flex-1 overflow-y-auto px-4 py-8">
         <div className="max-w-3xl mx-auto w-full h-full flex flex-col">
@@ -182,7 +220,18 @@ export default function Home() {
             <div className="flex-1 flex flex-col items-center justify-center text-center py-10">
               <Logo className="w-16 h-16 text-3xl mb-5 rounded-3xl" />
               <p className="text-3xl font-bold text-gray-800 mb-2">What do you want to know?</p>
-              <p className="text-gray-500 mb-10">Ask about any US legislation in plain English.</p>
+              <p className="text-gray-500 mb-8">Ask about any US legislation in plain English.</p>
+              <div className="grid sm:grid-cols-2 gap-3 w-full max-w-xl mb-8">
+                <Link href="/new" className="group text-left p-4 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white transition">
+                  <p className="font-semibold">What&apos;s new this week →</p>
+                  <p className="text-sm text-emerald-50/90 mt-0.5">New laws, votes and bills, in brief</p>
+                </Link>
+                <Link href="/topics" className="group text-left p-4 rounded-2xl border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 transition">
+                  <p className="font-semibold text-emerald-800">Browse by topic →</p>
+                  <p className="text-sm text-emerald-700/80 mt-0.5">Health, housing, education and more</p>
+                </Link>
+              </div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-3">Or try asking</p>
               <div className="grid sm:grid-cols-2 gap-3 w-full max-w-xl">
                 {suggestions.map((s, i) => (
                   <button
@@ -236,7 +285,7 @@ export default function Home() {
         </div>
       </div>
 
-      <div className="sticky bottom-0 border-t bg-white px-4 py-4">
+      <div className="sticky bottom-0 border-t border-gray-200 bg-white px-4 py-4">
         <div className="max-w-3xl mx-auto flex items-center gap-2">
           <input
             className="flex-1 border rounded-full px-5 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"

@@ -7,7 +7,8 @@ EMBED_BATCH = 16
 
 COLUMNS = ["content", "embedding", "source_name", "doc_type", "url", "date", "jurisdiction",
            "issue_tags", "title", "bill_number", "congress", "introduced_date",
-           "latest_action", "latest_action_date", "text_url", "passed_chamber"]
+           "latest_action", "latest_action_date", "text_url", "passed_chamber",
+           "policy_area", "docket_number"]
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     out = []

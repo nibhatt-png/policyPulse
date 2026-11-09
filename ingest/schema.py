@@ -34,7 +34,20 @@ MIGRATIONS = [
     "alter table documents add column if not exists text_url text",
     # passed at least one chamber (see ingest/policy.py); null = stored before this existed
     "alter table documents add column if not exists passed_chamber boolean",
+    # Congress.gov's policy area (assigned by CRS a few weeks after
+    # introduction); topic pages group bills by it (see rag/topics.py)
+    "alter table documents add column if not exists policy_area text",
     "create index if not exists documents_url_idx on documents (url)",
+    "create index if not exists documents_policy_area_idx on documents (policy_area)",
+    # cached AI summaries for the topic and "what's new" pages, regenerated
+    # only when the bills they're based on change (see rag/summaries.py)
+    """create table if not exists page_summaries (
+        key         text primary key,
+        inputs_hash text not null,
+        content     text not null,
+        created_at  timestamptz not null default now()
+    )""",
+    "alter table page_summaries enable row level security",
     # "recent activity" lookups by Congress + latest action date
     "create index if not exists documents_recent_idx on documents (congress, latest_action_date)",
     # The keep rule from ingest/policy.py, in SQL: delete bills that never
@@ -44,7 +57,8 @@ MIGRATIONS = [
     returns integer language sql as $$
         with gone as (
             delete from documents
-            where passed_chamber is not true
+            where doc_type = 'legislation'          -- never court rulings
+              and passed_chamber is not true
               and introduced_date < current_date - grace
             returning url
         )
@@ -52,6 +66,24 @@ MIGRATIONS = [
     $$""",
     # Supabase would otherwise let anyone call it through the REST API
     "revoke execute on function prune_stale_bills(interval) from public, anon, authenticated",
+    # ---- court rulings (ingest/run_courts.py): doc_type = 'ruling', the
+    # statutes that matched them in issue_tags
+    # CourtListener lists many cases more than once; court + date + docket
+    # number identifies a case across those duplicates
+    "alter table documents add column if not exists docket_number text",
+    # which statutes have been searched, so re-runs (which the 125-requests-a-day
+    # limit makes necessary) continue instead of starting over
+    """create table if not exists court_searches (
+        statute     text primary key,         -- e.g. '42 U.S.C. § 5122'
+        searched_at timestamptz not null default now(),
+        results     int not null,             -- opinions CourtListener matched
+        stored      int not null,             -- cases newly stored
+        tagged      int not null default 0    -- already-stored cases given this statute's tag
+    )""",
+    "alter table court_searches enable row level security",
+    # bills and rulings both store U.S. Code sections in issue_tags (see
+    # ingest/statutes.py); the bill <-> ruling links match on overlaps
+    "create index if not exists documents_issue_tags_idx on documents using gin (issue_tags)",
 ]
 
 PRUNE_JOB      = "prune-stale-bills"

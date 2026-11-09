@@ -29,8 +29,16 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 def source_header(c: dict) -> str:
-    """e.g. [H.R. 132: Title | 119th Congress | Latest action 2026-10-29: Referred to ...]"""
-    parts = [bill_label(c)]
+    """e.g. [H.R. 132: Title | 119th Congress | Latest action 2026-10-29: Referred to ...]
+    or [Court ruling: Nken v. Holder | Supreme Court of the United States | Decided 2009-04-22]"""
+    if c.get("doc_type") == "ruling":
+        parts = [c.get("title") or "Untitled case", c.get("source"),
+                 f"Decided {c['date']}" if c.get("date") else None,
+                 f"Interprets {', '.join(c['issue_tags'])}" if c.get("issue_tags") else None]
+        return "[Court ruling: " + " | ".join(p for p in parts if p) + "]"
+    parts = ["Bill: " + bill_label(c)]
+    if c.get("companions"):
+        parts.append(f"Same bill also introduced as {', '.join(c['companions'])}")
     if c.get("congress"):
         parts.append(f"{ordinal(c['congress'])} Congress")
     if c.get("latest_action"):
@@ -74,7 +82,12 @@ Your job is to make complex legislation simple and accessible. You:
 Today is {today}. The current Congress is the {congress} ({start}–{end}).
 - Each source is labeled with its Congress and its latest action. Use them to say where a bill stands right now (e.g. "introduced and referred to committee", "passed the House").
 - A bill from an earlier Congress that did not become law died when that Congress ended (on January 3 of the year the next one began). Never call it active, pending or "still moving"; say it expired, and note that it would have to be reintroduced.
-- When asked what Congress is doing now, focus on {congress} Congress bills and their most recent actions."""
+- When asked what Congress is doing now, focus on {congress} Congress bills and their most recent actions.
+- Sources are of two kinds, and people often confuse them, so keep them clearly apart:
+  - "Bill" sources are proposals. Say what a bill "would" do or "proposes"; never describe a bill's provisions as current law unless its latest action says it became law.
+  - "Court ruling" sources are decisions about laws already on the books. Say what "the court held" or "ruled", with the court and year from the label, and name the statute it interprets. Never call a ruling a bill or give it a legislative status.
+  - When both appear, connect them where they share a law: what the law says now according to the court, then what the bill would change.
+  - A ruling may only be about a related law. If no ruling directly addresses the question, say so plainly instead of implying one does."""
 
     recent_note = f"""These sources are not a topic search: they are the {congress} Congress bills with the most significant recent actions as of {today} (new laws first, then floor votes, then committee action). Summarize what Congress has been doing lately, most significant first, grouped by how far each bill got, and give the date of each action.
 
@@ -87,7 +100,7 @@ Today is {today}. The current Congress is the {congress} ({start}–{end}).
 </sources>
 
 Rules:
-- Cite sources inline as [Bill Number: Bill Title], using the label at the top of each source
+- Cite sources inline as [Bill Number: Bill Title] for bills and [Case Name (Year)] for court rulings, using the label at the top of each source
 - Explain what each bill actually DOES in practice for regular people
 - If bills conflict or take opposing sides, point that out
 - Format with Markdown (headings, bullet lists, bold, tables where helpful). Never use HTML tags such as <br>; keep table cells to a sentence or two, and use a bullet list instead of a table when items need more detail

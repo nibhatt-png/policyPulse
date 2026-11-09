@@ -21,7 +21,19 @@ RECENT_DAYS = 30
 RECENT_PER_STAGE = 3
 
 COLUMNS = ["content", "source", "url", "doc_type", "date", "title", "bill_number",
-           "congress", "latest_action", "latest_action_date", "similarity"]
+           "congress", "latest_action", "latest_action_date", "issue_tags", "similarity"]
+SELECT = """content, source_name, url, doc_type, date, title, bill_number,
+            congress, latest_action, latest_action_date, issue_tags"""
+
+# Court rulings are searched separately from bills and merged in, so the far
+# more numerous bill chunks can't crowd out a relevant ruling: up to
+# MAX_RULINGS of the result slots go to rulings at most RULING_MARGIN less
+# similar than the best bill. An unrelated ruling still stays out.
+MAX_RULINGS   = 3
+RULING_MARGIN = 0.05   # checked on 8 questions: keeps Medicaid/FOIA/asylum cases, drops off-topic ones
+# A ruling's issue_tags list the statutes it was matched on; a bill's list
+# every section it cites (often dozens), which the sources don't need.
+MAX_TAGS_RETURNED = 5
 
 def current_congress(today: date | None = None) -> int:
     # each Congress starts January 3 of an odd year; the 1st began in 1789
@@ -36,11 +48,52 @@ def _to_dicts(rows) -> list[dict]:
         d = dict(zip(COLUMNS, r))
         d["similarity"] = float(d["similarity"]) if d["similarity"] is not None else None
         d["latest_action_date"] = str(d["latest_action_date"]) if d["latest_action_date"] else None
+        d["date"] = str(d["date"]) if d["date"] else None
+        d["issue_tags"] = (d["issue_tags"] or [])[:MAX_TAGS_RETURNED] if d["doc_type"] == "ruling" else []
         out.append(d)
     return out
 
+def _search(cur, vec: str, doc_type: str, limit: int, candidates: int, exact: bool) -> list[dict]:
+    """Best-matching chunk per document of one type, best first. exact=True
+    scans every row (cheap for the few hundred ruling chunks; the HNSW index
+    would return mostly bill chunks and leave too few rulings after filtering)."""
+    distance = "(embedding <=> %(vec)s::vector)" + (" + 0" if exact else "")   # "+ 0" bypasses the index
+    cur.execute(f"""
+        with candidates as (
+            select {SELECT}, {distance} as distance
+            from documents
+            where doc_type = %(doc_type)s
+            order by {distance}
+            limit %(candidates)s
+        ),
+        best_per_doc as (
+            select distinct on (url) * from candidates order by url, distance
+        )
+        select {SELECT}, 1 - distance as similarity
+        from best_per_doc
+        order by distance + case when congress = %(current)s or doc_type = 'ruling' then 0 else %(penalty)s end
+        limit %(limit)s
+    """, {"vec": vec, "doc_type": doc_type, "candidates": candidates, "limit": limit,
+          "current": current_congress(), "penalty": PAST_CONGRESS_PENALTY})
+    return _to_dicts(cur.fetchall())
+
+def _merge_companions(bills: list[dict]) -> list[dict]:
+    """The same bill is often introduced in both chambers under one title
+    (e.g. H.R. 9778 and S. 5033); keep the better match and note the other."""
+    kept, by_title = [], {}
+    for b in bills:
+        key = (b["title"] or "").strip().lower() or b["url"]
+        if key in by_title:
+            if b["bill_number"]:
+                by_title[key].setdefault("companions", []).append(b["bill_number"])
+            continue
+        by_title[key] = b
+        kept.append(b)
+    return kept
+
 def retrieve(query: str, top_k: int = 5) -> list[dict]:
-    """Return the top_k most similar bills (one best-matching chunk per bill)."""
+    """The top_k most similar documents (one best-matching chunk each):
+    bills, plus up to MAX_RULINGS court rulings that are about as relevant."""
     embedding  = ollama.embeddings(model="nomic-embed-text", prompt=query)["embedding"]
     vec_str    = "[" + ",".join(str(x) for x in embedding) + "]"
     candidates = min(max(top_k * CANDIDATES_PER_RESULT, MIN_CANDIDATES), 1000)
@@ -48,31 +101,19 @@ def retrieve(query: str, top_k: int = 5) -> list[dict]:
     def query_db(cur):
         # SET LOCAL lasts only for this transaction
         cur.execute("set local hnsw.ef_search = %s", [candidates])
-        cur.execute("""
-            with candidates as (
-                select content, source_name, url, doc_type, date, title, bill_number,
-                       congress, latest_action, latest_action_date,
-                       embedding <=> %(vec)s::vector as distance
-                from documents
-                order by embedding <=> %(vec)s::vector
-                limit %(candidates)s
-            ),
-            best_per_bill as (
-                select distinct on (url) *
-                from candidates
-                order by url, distance
-            )
-            select content, source_name, url, doc_type, date, title, bill_number,
-                   congress, latest_action, latest_action_date,
-                   1 - distance as similarity
-            from best_per_bill
-            order by distance + case when congress = %(current)s then 0 else %(penalty)s end
-            limit %(top_k)s
-        """, {"vec": vec_str, "candidates": candidates, "top_k": top_k,
-              "current": current_congress(), "penalty": PAST_CONGRESS_PENALTY})
-        return cur.fetchall()
+        bills   = _search(cur, vec_str, "legislation", top_k * 2, candidates, exact=False)
+        rulings = _search(cur, vec_str, "ruling", MAX_RULINGS, MAX_RULINGS * CANDIDATES_PER_RESULT, exact=True)
+        return bills, rulings
 
-    return _to_dicts(db.run(query_db))
+    bills, rulings = db.run(query_db)
+    bills = _merge_companions(bills)
+    if not bills:
+        return rulings[:top_k]
+    best = bills[0]["similarity"]
+    rulings = [r for r in rulings if r["similarity"] >= best - RULING_MARGIN]
+    picked = bills[:top_k - len(rulings)] + rulings
+    # most similar first, so the model and the source list lead with the best match
+    return sorted(picked, key=lambda d: -d["similarity"])
 
 # How far a bill has gotten, judged from its latest action. Most latest actions
 # are routine committee referrals, so ranking by date alone would mostly surface
@@ -118,7 +159,7 @@ def recent_activity(top_k: int = 8) -> list[dict]:
             )
             select distinct on (t.stage, t.action_date, d.url)
                    d.content, d.source_name, d.url, d.doc_type, d.date, d.title, d.bill_number,
-                   d.congress, d.latest_action, d.latest_action_date, null as similarity
+                   d.congress, d.latest_action, d.latest_action_date, d.issue_tags, null as similarity
             from top_bills t
             join documents d on d.url = t.url
             order by t.stage desc, t.action_date desc, d.url, d.id   -- first chunk = start of the bill

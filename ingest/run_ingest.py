@@ -23,9 +23,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ingest.schema import ensure_schema
 from ingest.policy import passed_a_chamber, in_grace_period, is_ceremonial, grace_cutoff
 from ingest.sources.congress import (fetch_all_bills, fetch_text_versions, newest_version,
-                                     earliest_version, version_text_url)
+                                     earliest_version, version_text_url, fetch_policy_area)
 from ingest.parse import url_to_text, clean_text
 from ingest.chunk import chunk_document
+from ingest.statutes import statutes_in
 from ingest.embed import embed_and_store
 from rag import db
 
@@ -34,7 +35,7 @@ from rag import db
 MAX_FAILURES_IN_A_ROW = 25
 
 META_FIELDS = ["title", "bill_number", "congress", "date", "introduced_date",
-               "latest_action", "latest_action_date", "passed_chamber"]
+               "latest_action", "latest_action_date", "passed_chamber", "policy_area"]
 
 def stored_bills(conn, congress: int) -> dict[str, tuple]:
     """url -> (stored update date, stored text_url, passed_chamber) for bills already ingested."""
@@ -66,13 +67,16 @@ def process(bill: dict, stored: tuple | None) -> str:
     text_url = version_text_url(newest_version(versions) if passed else earliest_version(versions))
     if not text_url:
         return "no text yet"
-    bill = {**bill, "passed_chamber": passed, "text_url": text_url}
+    # one more API call, only for bills being kept (the list doesn't include it)
+    bill = {**bill, "passed_chamber": passed, "text_url": text_url,
+            "policy_area": fetch_policy_area(bill["url"])}
     if stored and stored[1] == text_url:
         update_metadata(bill)
         return "actions updated"
 
     text   = clean_text(url_to_text(text_url))
-    chunks = chunk_document(text, bill)
+    # the U.S. Code sections it cites: links it to court rulings (ingest/statutes.py)
+    chunks = chunk_document(text, {**bill, "issue_tags": statutes_in(text)})
     ids    = embed_and_store(chunks)
     return f"{'re-embedded' if stored else 'stored'} {len(ids)} chunks ({'passed' if passed else 'draft'})"
 

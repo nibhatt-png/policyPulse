@@ -23,7 +23,7 @@ def main():
     ensure_schema(conn)
     cur = conn.cursor()
 
-    cur.execute("select distinct url from documents where (congress is null or title is null) and url is not null")
+    cur.execute("select distinct url from documents where doc_type = 'legislation' and (congress is null or title is null) and url is not null")
     urls = [r[0] for r in cur.fetchall()]
     print(f"{len(urls)} bills need metadata")
     if not urls:

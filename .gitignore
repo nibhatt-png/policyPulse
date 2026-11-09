@@ -6,3 +6,8 @@ venv/
 .env
 __pycache__/
 *.pyc
+# ingest and daily-update logs, and the daily update's state file
+logs/
+*.log
+# CourtListener opinion texts (re-downloading costs scarce API requests)
+.cache/

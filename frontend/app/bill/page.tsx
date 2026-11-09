@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Markdown from "../Markdown";
 import SiteHeader from "../SiteHeader";
@@ -97,7 +97,29 @@ type BillDetail = {
   statutes?: string[];   // for a ruling: the U.S. Code sections it interprets
 };
 
+function LoadingScreen() {
+  return (
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+      <div className="text-center">
+        <div className="text-4xl mb-4">🌿</div>
+        <p className="text-gray-500">Generating plain English summary...</p>
+      </div>
+    </div>
+  );
+}
+
+// The page is prerendered at build time, when there's no ?url= yet, so the
+// part that reads it (useSearchParams) renders in the browser inside a
+// Suspense boundary; the build fails without one.
 export default function BillPage() {
+  return (
+    <Suspense fallback={<LoadingScreen />}>
+      <BillPageContent />
+    </Suspense>
+  );
+}
+
+function BillPageContent() {
   const params  = useSearchParams();
   const billUrl = params.get("url");
 
@@ -123,14 +145,7 @@ export default function BillPage() {
       .finally(() => setLoading(false));
   }, [billUrl]);
 
-  if (loading) return (
-    <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-      <div className="text-center">
-        <div className="text-4xl mb-4">🌿</div>
-        <p className="text-gray-500">Generating plain English summary...</p>
-      </div>
-    </div>
-  );
+  if (loading) return <LoadingScreen />;
 
   if (error) return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center">

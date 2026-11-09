@@ -8,7 +8,7 @@ right after the daily ingest, so visitors rarely wait for one.
 """
 import hashlib
 from rag import db
-from rag.synthesizer import client, MODEL, clean_markdown
+from rag.synthesizer import groq_client, MODEL, clean_markdown
 from rag.browse import STATUS_LABELS
 
 MAX_BILLS_IN_PROMPT = 35
@@ -74,7 +74,7 @@ def lookup(key: str, prompt: str) -> str | None:
 
 def generate(key: str, prompt: str) -> str:
     """Ask the model for a summary and cache it."""
-    resp = client.chat.completions.create(
+    resp = groq_client().chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=MAX_TOKENS,

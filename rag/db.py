@@ -23,11 +23,17 @@ _pool_lock = threading.Lock()
 # Supabase dropped while it sat idle in the pool, instead of it hanging.
 KEEPALIVES = dict(keepalives=1, keepalives_idle=60, keepalives_interval=10, keepalives_count=3)
 
+class ConfigError(Exception):
+    """A required setting (environment variable) is missing."""
+
 def _get_pool() -> ThreadedConnectionPool:
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = ThreadedConnectionPool(MIN_CONN, MAX_CONN, os.getenv("DATABASE_URL"), **KEEPALIVES)
+            url = os.getenv("DATABASE_URL")
+            if not url:   # psycopg2 would otherwise quietly try a local database
+                raise ConfigError("DATABASE_URL isn't set")
+            _pool = ThreadedConnectionPool(MIN_CONN, MAX_CONN, url, **KEEPALIVES)
         return _pool
 
 def _is_connection_error(e: Exception) -> bool:

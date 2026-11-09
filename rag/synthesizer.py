@@ -2,10 +2,22 @@ import os, re
 from datetime import date
 from groq import Groq
 from rag.retriever import current_congress
+from rag.db import ConfigError
 from dotenv import load_dotenv
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_client: Groq | None = None
+
+def groq_client() -> Groq:
+    """Created on first use, not at import: with GROQ_API_KEY unset, creating it
+    at import crashed the whole API (every route a 500), not just AI answers."""
+    global _client
+    if _client is None:
+        key = os.getenv("GROQ_API_KEY")
+        if not key:
+            raise ConfigError("GROQ_API_KEY isn't set")
+        _client = Groq(api_key=key)
+    return _client
 
 # llama-3.3-70b-versatile was retired by Groq; override with GROQ_MODEL in .env
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -118,7 +130,7 @@ Rules:
         "content": f"{context_prompt}\n\nQuestion: {query}"
     })
 
-    resp = client.chat.completions.create(
+    resp = groq_client().chat.completions.create(
         model=MODEL,
         messages=messages,
         max_tokens=2000,

@@ -7,11 +7,12 @@ load_dotenv()
 
 from rag.retriever import retrieve, recent_activity, is_topicless
 from rag import db
-from rag.synthesizer import synthesize, clean_markdown, MODEL
+from rag.synthesizer import synthesize, clean_markdown, groq_client, MODEL
+from rag.db import ConfigError
 from rag.topics import TOPICS_BY_SLUG
 from rag import browse, summaries
 from rag.embeddings import EmbeddingError
-from groq import Groq, APIStatusError, APIConnectionError
+from groq import APIStatusError, APIConnectionError
 import os, traceback, psycopg2
 
 app = FastAPI()
@@ -30,7 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 class Message(BaseModel):
     role: str
@@ -67,6 +67,9 @@ def readable_error(e: Exception) -> HTTPException:
         return HTTPException(503, "Couldn't reach the AI model. Check your internet connection and try again.")
     if isinstance(e, psycopg2.Error):
         return HTTPException(503, "Couldn't reach the bill database. Check your internet connection and try again.")
+    if isinstance(e, ConfigError):
+        print(f"configuration error: {e}", flush=True)
+        return HTTPException(503, "The server is missing a setting. See /api/health.")
     if isinstance(e, EmbeddingError):
         print(f"embedding failed: {e}", flush=True)
         return HTTPException(503, "Couldn't reach the search service. Wait a moment and try again.")
@@ -161,7 +164,7 @@ Bill text:
 {full_text[:4000]}"""
 
     try:
-        resp = groq_client.chat.completions.create(
+        resp = groq_client().chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2500,
@@ -294,6 +297,22 @@ def whats_new_summary(days: int = 7):
         return {"summary": summaries.period_summary(browse.whats_new(days=days))}
     except Exception as e:
         raise readable_error(e)
+
+@router.get("/health")
+def health():
+    """For checking a deployment: which settings are present (names only, never
+    values) and whether the database answers. Open /api/health in a browser."""
+    names = ["DATABASE_URL", "GROQ_API_KEY", "NOMIC_API_KEY"]
+    out = {"settings": {n: bool(os.getenv(n)) for n in names}}
+    try:
+        db.run(lambda cur: cur.execute("select 1"))
+        out["database"] = "ok"
+    except Exception as e:
+        # the first line of the error names the problem (e.g. too many connections);
+        # connection errors don't include the password
+        out["database"] = f"{type(e).__name__}: {str(e).strip().splitlines()[0][:200] if str(e).strip() else ''}"
+    out["ok"] = out["database"] == "ok" and all(out["settings"].values())
+    return out
 
 # after all routes are defined on the router
 app.include_router(router)
